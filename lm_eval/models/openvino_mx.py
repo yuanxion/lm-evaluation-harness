@@ -307,7 +307,6 @@ class OpenVINOMX(LM):
                         f"openvino-mx generate_until failed at request index {req_idx} with image shapes {image_shapes}: {err}"
                     ) from err
             text = output.texts[0] if output and output.texts else ""
-            print(f"Generated text before applying 'until': {text}")
             results.append(self._apply_stop(text, until))
 
         return results

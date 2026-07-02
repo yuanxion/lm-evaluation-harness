@@ -55,9 +55,12 @@ class OpenVINOMX(LM):
 
         self.ov = ov
         self.GenerationConfig = GenerationConfig
-        print("!!!!!!! VLMPIPELINE PRETRAINED device", self._device)
-        self.pipe = VLMPipeline(self.pretrained, self._device)
+        pretrained_path = Path(self.pretrained)
+        self.pipe = None
+        if not pretrained_path.is_file():
+            self.pipe = VLMPipeline(self.pretrained, self._device)
         self.allow_text_only = bool(kwargs.get("allow_text_only", True))
+        self.prompt_suffix = str(kwargs.get("prompt_suffix", ""))
         self.text_pipe = LLMPipeline(self.pretrained, self._device)
         self.min_image_side = int(
             kwargs.get("min_image_side", self._infer_min_image_side(self.pretrained))
@@ -280,6 +283,8 @@ class OpenVINOMX(LM):
             prompt = self._extract_prompt(context)
             if not prompt:
                 raise ValueError("openvino-mx could not extract a text prompt.")
+            if self.prompt_suffix:
+                prompt = f"{prompt} {self.prompt_suffix}"
 
             if image_tensors is None:
                 if not self.allow_text_only:
@@ -297,6 +302,11 @@ class OpenVINOMX(LM):
                         f"openvino-mx text-only generate_until failed at request index {req_idx}: {err}"
                     ) from err
             else:
+                if self.pipe is None:
+                    raise ValueError(
+                        "openvino-mx received image input, but pretrained points to a "
+                        "text-only model file that cannot initialize VLMPipeline."
+                    )
                 try:
                     output = self.pipe.generate(prompt, image_tensors, cfg)
                 except RuntimeError as err:

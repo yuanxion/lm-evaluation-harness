@@ -28,6 +28,29 @@ class OpenVINOMX(LM):
 
     MULTIMODAL = True
 
+    @staticmethod
+    def _parse_llamacpp_device(device: str | None) -> dict:
+        if device is None:
+            return {}
+
+        device_normalized = str(device).strip()
+        device_upper = device_normalized.upper()
+
+        if device_upper == "CPU":
+            return {}
+
+        if device_upper.startswith("VULKAN"):
+            suffix = device_normalized[len("Vulkan") :]
+            gpu_index = 0 if suffix == "" else int(suffix)
+            return {"main_gpu": gpu_index}
+
+        if device_upper.startswith("GPU"):
+            suffix = device_normalized[len("GPU") :].lstrip(".")
+            gpu_index = 0 if suffix == "" else int(suffix)
+            return {"main_gpu": gpu_index}
+
+        return {}
+
     def __init__(
         self,
         pretrained: str,
@@ -39,6 +62,11 @@ class OpenVINOMX(LM):
         self.pretrained = pretrained
         self._device = device
         self.default_max_new_tokens = int(max_new_tokens)
+        self.use_llamacpp = bool(kwargs.get("llamacpp", False))
+        self.llamacpp_chat = bool(kwargs.get("llamacpp_chat", False))
+        self.llamacpp_n_ctx = kwargs.get("llamacpp_n_ctx")
+        self.llamacpp_n_gpu_layers = kwargs.get("llamacpp_n_gpu_layers")
+        self.llama = None
 
         if not find_spec("openvino"):
             raise ModuleNotFoundError(
@@ -58,10 +86,37 @@ class OpenVINOMX(LM):
         pretrained_path = Path(self.pretrained)
         self.pipe = None
         if not pretrained_path.is_file():
-            self.pipe = VLMPipeline(self.pretrained, self._device)
+            try:
+                self.pipe = VLMPipeline(self.pretrained, self._device)
+            except RuntimeError as err:
+                # Not every OpenVINO IR directory is multimodal (e.g. a plain
+                # optimum-cli text LLM export has no vision tower/language-model
+                # split). Fall back to text-only via LLMPipeline below.
+                eval_logger.warning(
+                    "openvino-mx: VLMPipeline init failed for %s, falling back to "
+                    "text-only LLMPipeline: %s",
+                    self.pretrained,
+                    err,
+                )
+                self.pipe = None
         self.allow_text_only = bool(kwargs.get("allow_text_only", True))
         self.prompt_suffix = str(kwargs.get("prompt_suffix", ""))
-        self.text_pipe = LLMPipeline(self.pretrained, self._device)
+        self.text_pipe = None
+        if self.use_llamacpp:
+            if not find_spec("llama_cpp"):
+                raise ModuleNotFoundError(
+                    "package `llama_cpp` is not installed. Please install llama-cpp-python first."
+                )
+            from llama_cpp import Llama
+
+            llama_kwargs = self._parse_llamacpp_device(self._device)
+            if self.llamacpp_n_ctx is not None:
+                llama_kwargs["n_ctx"] = int(self.llamacpp_n_ctx)
+            if self.llamacpp_n_gpu_layers is not None:
+                llama_kwargs["n_gpu_layers"] = int(self.llamacpp_n_gpu_layers)
+            self.llama = Llama(self.pretrained, **llama_kwargs)
+        else:
+            self.text_pipe = LLMPipeline(self.pretrained, self._device)
         self.min_image_side = int(
             kwargs.get("min_image_side", self._infer_min_image_side(self.pretrained))
         )
@@ -241,6 +296,43 @@ class OpenVINOMX(LM):
             kwargs["do_sample"] = gen_kwargs["do_sample"]
         return kwargs
 
+    @staticmethod
+    def _llamacpp_generate_kwargs(gen_kwargs: dict, default_max_new_tokens: int) -> dict:
+        kwargs = {
+            "max_tokens": int(gen_kwargs.get("max_gen_toks", default_max_new_tokens)),
+            "temperature": float(gen_kwargs.get("temperature", 0.0)),
+        }
+        if "top_p" in gen_kwargs:
+            kwargs["top_p"] = float(gen_kwargs["top_p"])
+        if "top_k" in gen_kwargs:
+            kwargs["top_k"] = int(gen_kwargs["top_k"])
+        if "repetition_penalty" in gen_kwargs:
+            kwargs["repeat_penalty"] = float(gen_kwargs["repetition_penalty"])
+        return kwargs
+
+    def _llamacpp_generate(self, prompt: str, until: list[str] | None, gen_kwargs: dict) -> str:
+        if self.llama is None:
+            raise RuntimeError("openvino-mx llama-cpp mode is enabled but model is not initialized")
+
+        llama_kwargs = self._llamacpp_generate_kwargs(gen_kwargs, self.default_max_new_tokens)
+        if until:
+            llama_kwargs["stop"] = until
+
+        if self.llamacpp_chat:
+            response = self.llama.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                **llama_kwargs,
+            )
+            content = (
+                response.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+            )
+            return str(content)
+
+        response = self.llama.create_completion(prompt=prompt, **llama_kwargs)
+        return str(response.get("choices", [{}])[0].get("text", ""))
+
     def generate_until(
         self, requests: list[Instance], disable_tqdm: bool = False
     ) -> list[str]:
@@ -292,16 +384,25 @@ class OpenVINOMX(LM):
                         "openvino-mx requires image input in aux_arguments['visual']. "
                         "Set model_args allow_text_only=true to enable LLMPipeline fallback."
                     )
-                llm_kwargs = self._llm_generate_kwargs(
-                    gen_kwargs, self.default_max_new_tokens
-                )
                 try:
+                    if self.use_llamacpp:
+                        text = self._llamacpp_generate(prompt, until, gen_kwargs)
+                        results.append(self._apply_stop(text, until))
+                        continue
+
+                    llm_kwargs = self._llm_generate_kwargs(
+                        gen_kwargs, self.default_max_new_tokens
+                    )
                     output = self.text_pipe.generate(prompt, **llm_kwargs)
                 except RuntimeError as err:
                     raise RuntimeError(
                         f"openvino-mx text-only generate_until failed at request index {req_idx}: {err}"
                     ) from err
             else:
+                if self.use_llamacpp:
+                    raise ValueError(
+                        "openvino-mx llama-cpp mode currently supports text-only requests and does not accept image input."
+                    )
                 if self.pipe is None:
                     raise ValueError(
                         "openvino-mx received image input, but pretrained points to a "

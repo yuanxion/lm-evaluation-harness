@@ -9,7 +9,8 @@ doc_to_target: "{{['A', 'B', 'C', 'D'][answer]}}"
 generation_kwargs:
   until:
     - "</s>"
-    - "\n"
+    - "Question:"
+  max_gen_toks: 512
 metric_list:
   - metric: exact_match
     aggregation: mean
@@ -19,14 +20,13 @@ metric_list:
 filter_list:
   - name: get_response
     filter:
-      # Filter everything after the first break line
+      # Qwen3's raw continuation for an "Answer:" prompt reasons first (often
+      # starting with a leading newline) before stating a letter, so unlike the
+      # original "first line only" filter we search the whole response and take
+      # the LAST standalone A/B/C/D — the model's final stated choice.
       - function: "regex"
-        regex_pattern: "^(.*?)(?=\\n|$)"
-      # Remove leading white spaces
-      - function: remove_whitespace
-      # function to ignore right white spaces or line breaks
-      - function: "regex"
-        regex_pattern: "^(.*?)\\s*$"
+        regex_pattern: "\\b([ABCD])\\b"
+        group_select: -1
       - function: take_first
 metadata:
   version: 3.0

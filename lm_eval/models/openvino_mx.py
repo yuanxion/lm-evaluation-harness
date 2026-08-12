@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 from importlib.util import find_spec
 from math import ceil
+from textwrap import shorten
 
 import numpy as np
 from tqdm import tqdm
@@ -29,6 +30,22 @@ class OpenVINOMX(LM):
     MULTIMODAL = True
 
     @staticmethod
+    def _to_bool(value, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "y", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "n", "off", ""}:
+                return False
+        return bool(value)
+
+    @staticmethod
     def _parse_llamacpp_device(device: str | None) -> dict:
         if device is None:
             return {}
@@ -51,6 +68,79 @@ class OpenVINOMX(LM):
 
         return {}
 
+    @staticmethod
+    def _maybe_int(value):
+        if value is None or value == "":
+            return None
+        return int(value)
+
+    @staticmethod
+    def _scheduler_kwarg(kwargs: dict, key: str):
+        if key in kwargs:
+            return kwargs[key]
+        prefixed_key = f"scheduler_{key}"
+        if prefixed_key in kwargs:
+            return kwargs[prefixed_key]
+        return None
+
+    def _build_text_scheduler_config(self, scheduler_config_cls, kwargs):
+        device_upper = str(self._device).upper()
+        explicit_overrides = {}
+
+        int_fields = (
+            "max_num_batched_tokens",
+            "num_kv_blocks",
+            "cache_size",
+            "num_linear_attention_blocks",
+            "cache_interval_multiplier",
+            "max_num_seqs",
+        )
+        bool_fields = (
+            "dynamic_split_fuse",
+            "enable_prefix_caching",
+            "use_cache_eviction",
+            "use_sparse_attention",
+        )
+
+        for field in int_fields:
+            value = self._scheduler_kwarg(kwargs, field)
+            if value is not None:
+                explicit_overrides[field] = self._maybe_int(value)
+
+        for field in bool_fields:
+            value = self._scheduler_kwarg(kwargs, field)
+            if value is not None:
+                explicit_overrides[field] = self._to_bool(value)
+
+        # lm-eval runs one independent prompt at a time here; on GPU, leaving
+        # client-style prefix caching enabled can retain KV data across prompts
+        # and eventually exhaust device resources despite short inputs.
+        default_overrides = {}
+        if "GPU" in device_upper:
+            default_overrides = {
+                "max_num_batched_tokens": 256,
+                "dynamic_split_fuse": True,
+                "enable_prefix_caching": False,
+            }
+
+        merged_overrides = default_overrides | explicit_overrides
+        if not merged_overrides:
+            return None
+
+        scheduler_config = scheduler_config_cls()
+        for field, value in merged_overrides.items():
+            setattr(scheduler_config, field, value)
+
+        eval_logger.info(
+            "openvino-mx: enabling text LLMPipeline scheduler_config on %s with %s",
+            self._device,
+            {
+                field: getattr(scheduler_config, field)
+                for field in merged_overrides
+            },
+        )
+        return scheduler_config
+
     def __init__(
         self,
         pretrained: str,
@@ -62,27 +152,67 @@ class OpenVINOMX(LM):
         self.pretrained = pretrained
         self._device = device
         self.default_max_new_tokens = int(max_new_tokens)
-        self.use_llamacpp = bool(kwargs.get("llamacpp", False))
-        self.llamacpp_chat = bool(kwargs.get("llamacpp_chat", False))
+        self.use_genai_direct = self._to_bool(kwargs.get("genai_direct", False), False)
+        self.use_llamacpp = self._to_bool(kwargs.get("llamacpp", False), False)
+        self.llamacpp_chat = self._to_bool(kwargs.get("llamacpp_chat", False), False)
         self.llamacpp_n_ctx = kwargs.get("llamacpp_n_ctx")
         self.llamacpp_n_gpu_layers = kwargs.get("llamacpp_n_gpu_layers")
         self.llama = None
+        self.debug_prompt_log_path = kwargs.get("debug_prompt_log_path")
+        self.debug_failure_log_path = kwargs.get("debug_failure_log_path")
+        self.debug_prompt_log_max = int(kwargs.get("debug_prompt_log_max", 5))
+        self._debug_prompt_log_count = 0
 
         if not find_spec("openvino"):
             raise ModuleNotFoundError(
                 "package `openvino` is not installed. Please install it first."
             )
 
-        if not find_spec("pipeline"):
-            raise ModuleNotFoundError(
-                "Could not import `pipeline`. Ensure your VLMPipeline module is importable."
+        if self.use_genai_direct:
+            # Bypass the pipeline.mx C++ wrapper and its compiled dependency on
+            # the local river-gguf OpenVINO build entirely: pipeline.mx's
+            # compiled extension has an absolute RUNPATH baked in at build time
+            # pointing at openvino-install/, and building a second pipeline.mx
+            # against a pip-installed ("release package") OpenVINO wheel is not
+            # possible because release wheels don't export the openvino::core::dev
+            # CMake target pipeline.mx needs (only a full developer-package build
+            # does). So for testing against a plain pip OpenVINO/GenAI release
+            # ("OV_Master"), talk to openvino_genai directly instead -- same
+            # approach run_gguf_perf_single.sh uses for its non-local-build path.
+            if not find_spec("openvino_genai"):
+                raise ModuleNotFoundError(
+                    "genai_direct=true requires the `openvino_genai` package to be "
+                    "importable (the pip-installed OV_Master wheel, not pipeline.mx)."
+                )
+            import openvino as ov
+            from openvino_genai import (
+                GenerationConfig,
+                LLMPipeline,
+                SchedulerConfig,
+                VLMPipeline,
             )
+            text_pipeline_cls = LLMPipeline
+        else:
+            if not find_spec("pipeline"):
+                raise ModuleNotFoundError(
+                    "Could not import `pipeline`. Ensure your VLMPipeline module is importable."
+                )
+            if not find_spec("openvino_genai"):
+                raise ModuleNotFoundError(
+                    "Could not import `openvino_genai`. Ensure SchedulerConfig is importable."
+                )
 
-        import openvino as ov
-        from pipeline import GenerationConfig, LLMPipeline, VLMPipeline
+            import openvino as ov
+            from openvino_genai import LLMPipeline as GenAILLMPipeline, SchedulerConfig
+            from pipeline import GenerationConfig, LLMPipeline, VLMPipeline
+            text_pipeline_cls = GenAILLMPipeline
 
         self.ov = ov
         self.GenerationConfig = GenerationConfig
+        self._text_pipeline_cls = text_pipeline_cls
+        self.text_scheduler_config = self._build_text_scheduler_config(
+            SchedulerConfig, kwargs
+        )
         pretrained_path = Path(self.pretrained)
         self.pipe = None
         if not pretrained_path.is_file():
@@ -99,7 +229,7 @@ class OpenVINOMX(LM):
                     err,
                 )
                 self.pipe = None
-        self.allow_text_only = bool(kwargs.get("allow_text_only", True))
+        self.allow_text_only = self._to_bool(kwargs.get("allow_text_only", True), True)
         self.prompt_suffix = str(kwargs.get("prompt_suffix", ""))
         self.text_pipe = None
         if self.use_llamacpp:
@@ -116,7 +246,14 @@ class OpenVINOMX(LM):
                 llama_kwargs["n_gpu_layers"] = int(self.llamacpp_n_gpu_layers)
             self.llama = Llama(self.pretrained, **llama_kwargs)
         else:
-            self.text_pipe = LLMPipeline(self.pretrained, self._device)
+            if self.text_scheduler_config is None:
+                self.text_pipe = self._text_pipeline_cls(self.pretrained, self._device)
+            else:
+                self.text_pipe = self._text_pipeline_cls(
+                    self.pretrained,
+                    self._device,
+                    scheduler_config=self.text_scheduler_config,
+                )
         self.min_image_side = int(
             kwargs.get("min_image_side", self._infer_min_image_side(self.pretrained))
         )
@@ -124,6 +261,74 @@ class OpenVINOMX(LM):
         self.debug_image_dir = Path(kwargs.get("debug_image_dir", "openvino_mx_debug_images"))
         self.debug_image_dir.mkdir(parents=True, exist_ok=True)
         self._image_dump_counter = 0
+
+    def _log_final_prompt(self, prompt: str, req_idx: int) -> None:
+        if not self.debug_prompt_log_path:
+            return
+        if self._debug_prompt_log_count >= self.debug_prompt_log_max:
+            return
+
+        try:
+            out_path = Path(str(self.debug_prompt_log_path))
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with out_path.open("a", encoding="utf-8") as f:
+                f.write(f"--- request_index={req_idx} ---\n")
+                f.write(prompt)
+                f.write("\n\n")
+            self._debug_prompt_log_count += 1
+        except Exception as err:  # noqa: BLE001
+            eval_logger.warning("openvino-mx: failed to write prompt debug log: %s", err)
+
+    def _log_failed_prompt(
+        self,
+        prompt: str,
+        req_idx: int,
+        task_name: str | None,
+        doc_id: int | None,
+        err: Exception,
+    ) -> None:
+        if not self.debug_failure_log_path:
+            return
+
+        try:
+            out_path = Path(str(self.debug_failure_log_path))
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with out_path.open("a", encoding="utf-8") as f:
+                f.write(
+                    "--- "
+                    f"request_index={req_idx} "
+                    f"task_name={task_name} "
+                    f"doc_id={doc_id} "
+                    f"prompt_chars={len(prompt)} "
+                    f"error={type(err).__name__}"
+                    " ---\n"
+                )
+                f.write(prompt)
+                f.write("\n\n")
+        except Exception as log_err:  # noqa: BLE001
+            eval_logger.warning(
+                "openvino-mx: failed to write failed prompt debug log: %s", log_err
+            )
+
+    @staticmethod
+    def _instance_metadata(req: Instance) -> tuple[str | None, int | None, int | None]:
+        return req.task_name, req.doc_id, req.idx
+
+    @staticmethod
+    def _format_runtime_error_context(
+        req_idx: int,
+        task_name: str | None,
+        doc_id: int | None,
+        instance_idx: int | None,
+        prompt: str,
+    ) -> str:
+        prompt_preview = shorten(prompt.replace("\n", " "), width=240, placeholder="...")
+        return (
+            "openvino-mx generate_until failed "
+            f"at request_index={req_idx}, task_name={task_name}, doc_id={doc_id}, "
+            f"instance_idx={instance_idx}, prompt_chars={len(prompt)}, "
+            f"prompt_preview={prompt_preview!r}"
+        )
 
     @staticmethod
     def _infer_min_image_side(pretrained: str) -> int:
@@ -347,6 +552,8 @@ class OpenVINOMX(LM):
         )
 
         for req_idx, args in enumerate(iterator):
+            req = requests[req_idx]
+            task_name, doc_id, instance_idx = self._instance_metadata(req)
             if len(args) >= 3:
                 context, gen_kwargs, aux_arguments = args
             elif len(args) == 2:
@@ -377,6 +584,7 @@ class OpenVINOMX(LM):
                 raise ValueError("openvino-mx could not extract a text prompt.")
             if self.prompt_suffix:
                 prompt = f"{prompt} {self.prompt_suffix}"
+            self._log_final_prompt(prompt, req_idx)
 
             if image_tensors is None:
                 if not self.allow_text_only:
@@ -395,8 +603,9 @@ class OpenVINOMX(LM):
                     )
                     output = self.text_pipe.generate(prompt, **llm_kwargs)
                 except RuntimeError as err:
+                    self._log_failed_prompt(prompt, req_idx, task_name, doc_id, err)
                     raise RuntimeError(
-                        f"openvino-mx text-only generate_until failed at request index {req_idx}: {err}"
+                        f"{self._format_runtime_error_context(req_idx, task_name, doc_id, instance_idx, prompt)}: {err}"
                     ) from err
             else:
                 if self.use_llamacpp:
@@ -411,13 +620,21 @@ class OpenVINOMX(LM):
                 try:
                     output = self.pipe.generate(prompt, image_tensors, cfg)
                 except RuntimeError as err:
+                    self._log_failed_prompt(prompt, req_idx, task_name, doc_id, err)
                     image_shapes = [
                         tuple(getattr(tensor, "shape", ())) for tensor in image_tensors
                     ]
                     raise RuntimeError(
-                        f"openvino-mx generate_until failed at request index {req_idx} with image shapes {image_shapes}: {err}"
+                        f"{self._format_runtime_error_context(req_idx, task_name, doc_id, instance_idx, prompt)} with image shapes {image_shapes}: {err}"
                     ) from err
-            text = output.texts[0] if output and output.texts else ""
+            # openvino_genai's own Python binding for LLMPipeline.generate() returns a
+            # plain `str` for a single-string prompt (ergonomic API); pipeline.mx's C++
+            # wrapper always returns `DecodedResults`, requiring `.texts[0]`. Handle both
+            # since genai_direct=true routes here through openvino_genai directly.
+            if isinstance(output, str):
+                text = output
+            else:
+                text = output.texts[0] if output and output.texts else ""
             results.append(self._apply_stop(text, until))
 
         return results

@@ -68,79 +68,6 @@ class OpenVINOMX(LM):
 
         return {}
 
-    @staticmethod
-    def _maybe_int(value):
-        if value is None or value == "":
-            return None
-        return int(value)
-
-    @staticmethod
-    def _scheduler_kwarg(kwargs: dict, key: str):
-        if key in kwargs:
-            return kwargs[key]
-        prefixed_key = f"scheduler_{key}"
-        if prefixed_key in kwargs:
-            return kwargs[prefixed_key]
-        return None
-
-    def _build_text_scheduler_config(self, scheduler_config_cls, kwargs):
-        device_upper = str(self._device).upper()
-        explicit_overrides = {}
-
-        int_fields = (
-            "max_num_batched_tokens",
-            "num_kv_blocks",
-            "cache_size",
-            "num_linear_attention_blocks",
-            "cache_interval_multiplier",
-            "max_num_seqs",
-        )
-        bool_fields = (
-            "dynamic_split_fuse",
-            "enable_prefix_caching",
-            "use_cache_eviction",
-            "use_sparse_attention",
-        )
-
-        for field in int_fields:
-            value = self._scheduler_kwarg(kwargs, field)
-            if value is not None:
-                explicit_overrides[field] = self._maybe_int(value)
-
-        for field in bool_fields:
-            value = self._scheduler_kwarg(kwargs, field)
-            if value is not None:
-                explicit_overrides[field] = self._to_bool(value)
-
-        # lm-eval runs one independent prompt at a time here; on GPU, leaving
-        # client-style prefix caching enabled can retain KV data across prompts
-        # and eventually exhaust device resources despite short inputs.
-        default_overrides = {}
-        if "GPU" in device_upper:
-            default_overrides = {
-                "max_num_batched_tokens": 256,
-                "dynamic_split_fuse": True,
-                "enable_prefix_caching": False,
-            }
-
-        merged_overrides = default_overrides | explicit_overrides
-        if not merged_overrides:
-            return None
-
-        scheduler_config = scheduler_config_cls()
-        for field, value in merged_overrides.items():
-            setattr(scheduler_config, field, value)
-
-        eval_logger.info(
-            "openvino-mx: enabling text LLMPipeline scheduler_config on %s with %s",
-            self._device,
-            {
-                field: getattr(scheduler_config, field)
-                for field in merged_overrides
-            },
-        )
-        return scheduler_config
-
     def __init__(
         self,
         pretrained: str,
@@ -157,6 +84,10 @@ class OpenVINOMX(LM):
         self.llamacpp_chat = self._to_bool(kwargs.get("llamacpp_chat", False), False)
         self.llamacpp_n_ctx = kwargs.get("llamacpp_n_ctx")
         self.llamacpp_n_gpu_layers = kwargs.get("llamacpp_n_gpu_layers")
+        pretrained_path = Path(self.pretrained)
+        use_local_genai_for_gguf = (
+            pretrained_path.is_file() and not self.use_genai_direct and not self.use_llamacpp
+        )
         self.llama = None
         self.debug_prompt_log_path = kwargs.get("debug_prompt_log_path")
         self.debug_failure_log_path = kwargs.get("debug_failure_log_path")
@@ -168,7 +99,7 @@ class OpenVINOMX(LM):
                 "package `openvino` is not installed. Please install it first."
             )
 
-        if self.use_genai_direct:
+        if self.use_genai_direct or use_local_genai_for_gguf:
             # Bypass the pipeline.mx C++ wrapper and its compiled dependency on
             # the local river-gguf OpenVINO build entirely: pipeline.mx's
             # compiled extension has an absolute RUNPATH baked in at build time
@@ -181,39 +112,22 @@ class OpenVINOMX(LM):
             # approach run_gguf_perf_single.sh uses for its non-local-build path.
             if not find_spec("openvino_genai"):
                 raise ModuleNotFoundError(
-                    "genai_direct=true requires the `openvino_genai` package to be "
-                    "importable (the pip-installed OV_Master wheel, not pipeline.mx)."
+                    "openvino-mx requires the `openvino_genai` package to be importable "
+                    "for genai_direct=true or local GGUF-file fallback."
                 )
             import openvino as ov
-            from openvino_genai import (
-                GenerationConfig,
-                LLMPipeline,
-                SchedulerConfig,
-                VLMPipeline,
-            )
-            text_pipeline_cls = LLMPipeline
+            from openvino_genai import GenerationConfig, LLMPipeline, VLMPipeline
         else:
             if not find_spec("pipeline"):
                 raise ModuleNotFoundError(
                     "Could not import `pipeline`. Ensure your VLMPipeline module is importable."
                 )
-            if not find_spec("openvino_genai"):
-                raise ModuleNotFoundError(
-                    "Could not import `openvino_genai`. Ensure SchedulerConfig is importable."
-                )
 
             import openvino as ov
-            from openvino_genai import LLMPipeline as GenAILLMPipeline, SchedulerConfig
             from pipeline import GenerationConfig, LLMPipeline, VLMPipeline
-            text_pipeline_cls = GenAILLMPipeline
 
         self.ov = ov
         self.GenerationConfig = GenerationConfig
-        self._text_pipeline_cls = text_pipeline_cls
-        self.text_scheduler_config = self._build_text_scheduler_config(
-            SchedulerConfig, kwargs
-        )
-        pretrained_path = Path(self.pretrained)
         self.pipe = None
         if not pretrained_path.is_file():
             try:
@@ -229,6 +143,11 @@ class OpenVINOMX(LM):
                     err,
                 )
                 self.pipe = None
+        elif use_local_genai_for_gguf:
+            eval_logger.info(
+                "openvino-mx: using openvino_genai LLMPipeline directly for GGUF file %s",
+                self.pretrained,
+            )
         self.allow_text_only = self._to_bool(kwargs.get("allow_text_only", True), True)
         self.prompt_suffix = str(kwargs.get("prompt_suffix", ""))
         self.text_pipe = None
@@ -246,14 +165,7 @@ class OpenVINOMX(LM):
                 llama_kwargs["n_gpu_layers"] = int(self.llamacpp_n_gpu_layers)
             self.llama = Llama(self.pretrained, **llama_kwargs)
         else:
-            if self.text_scheduler_config is None:
-                self.text_pipe = self._text_pipeline_cls(self.pretrained, self._device)
-            else:
-                self.text_pipe = self._text_pipeline_cls(
-                    self.pretrained,
-                    self._device,
-                    scheduler_config=self.text_scheduler_config,
-                )
+            self.text_pipe = LLMPipeline(self.pretrained, self._device)
         self.min_image_side = int(
             kwargs.get("min_image_side", self._infer_min_image_side(self.pretrained))
         )

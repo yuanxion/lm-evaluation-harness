@@ -51,7 +51,12 @@ class OpenVINOMX(LM):
             )
 
         import openvino as ov
-        from pipeline import GenerationConfig, LLMPipeline, VLMPipeline
+        try:
+            from openvino.genai import GenerationConfig, LLMPipeline, VLMPipeline
+        except ModuleNotFoundError as err:
+            if err.name != "openvino.genai":
+                raise
+            from openvino_genai import GenerationConfig, LLMPipeline, VLMPipeline
 
         self.ov = ov
         self.GenerationConfig = GenerationConfig
@@ -230,6 +235,19 @@ class OpenVINOMX(LM):
         return out
 
     @staticmethod
+    def _extract_generated_text(output) -> str:
+        if output is None:
+            return ""
+        if isinstance(output, str):
+            return output
+        texts = getattr(output, "texts", None)
+        if texts:
+            return texts[0]
+        if isinstance(output, (list, tuple)) and output:
+            return OpenVINOMX._extract_generated_text(output[0])
+        return str(output)
+
+    @staticmethod
     def _llm_generate_kwargs(gen_kwargs: dict, default_max_new_tokens: int) -> dict:
         kwargs = {
             "max_new_tokens": int(gen_kwargs.get("max_gen_toks", default_max_new_tokens))
@@ -316,7 +334,7 @@ class OpenVINOMX(LM):
                     raise RuntimeError(
                         f"openvino-mx generate_until failed at request index {req_idx} with image shapes {image_shapes}: {err}"
                     ) from err
-            text = output.texts[0] if output and output.texts else ""
+            text = self._extract_generated_text(output)
             results.append(self._apply_stop(text, until))
 
         return results

@@ -23,9 +23,15 @@ metric_list:
 filter_list:
   - name: default
     filter:
-      # This captures the first single capital letter A/B/C/D
+      # Word-boundary version: the previous pattern "([ABCD])" matched ANY
+      # occurrence of A/B/C/D anywhere in the text, including inside other
+      # words -- e.g. a model that answers "Answer:\nD" got scored on the
+      # "A" from "Answer" instead of the real answer "D", since that "A"
+      # appears first. \b anchors ensure only a standalone letter (not part
+      # of a larger word) is captured, so both bare "D" and "Answer:\nD"
+      # style responses are scored correctly.
       - function: regex
-        regex_pattern: "([ABCD])"
+        regex_pattern: "\\b([ABCD])\\b"
       - function: take_first
 
 metadata:

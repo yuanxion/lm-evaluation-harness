@@ -292,6 +292,22 @@ class OpenVINOMX(LM):
             cfg.max_new_tokens = int(
                 gen_kwargs.get("max_gen_toks", self.default_max_new_tokens)
             )
+            # VLMPipeline's GenerationConfig defaults apply_chat_template to
+            # True (unlike llm_bench's LLMPipeline path, which always forces
+            # it False -- see text_generation.py's `gen_config.apply_chat_template
+            # = False`). For "thinking" models (e.g. Qwen3.5), the chat
+            # template's Jinja logic defaults enable_thinking to true unless
+            # explicitly told otherwise, and GenerationConfig has no
+            # enable_thinking field to override that from here -- so a
+            # templated prompt makes the model emit a long "Thinking
+            # Process..." block that eats the entire max_new_tokens budget
+            # before ever reaching a final answer, corrupting accuracy tasks
+            # like MMLU that expect a short direct answer. Disabling the
+            # template entirely (matching llm_bench's own behavior exactly)
+            # sends the model a raw, un-templated prompt, bypassing the
+            # thinking-mode trigger the same way the GenAI/LLMPipeline path
+            # already does.
+            cfg.apply_chat_template = False
 
             until = gen_kwargs.get("until")
             if until is not None and not isinstance(until, list):
@@ -310,15 +326,41 @@ class OpenVINOMX(LM):
                         "openvino-mx requires image input in aux_arguments['visual']. "
                         "Set model_args allow_text_only=true to enable LLMPipeline fallback."
                     )
-                llm_kwargs = self._llm_generate_kwargs(
-                    gen_kwargs, self.default_max_new_tokens
-                )
-                try:
-                    output = self.text_pipe.generate(prompt, **llm_kwargs)
-                except RuntimeError as err:
-                    raise RuntimeError(
-                        f"openvino-mx text-only generate_until failed at request index {req_idx}: {err}"
-                    ) from err
+                if self.pipe is not None:
+                    # `pretrained` is a VLM-shaped export (multi-component
+                    # IR with vision/embeddings/language sub-models, e.g.
+                    # NNCF-quantized Qwen3.5 exports) -- VLMPipeline was
+                    # already constructed successfully for it at __init__
+                    # time. A text-only request (no images) must still go
+                    # through THIS pipeline (VLMPipeline.generate accepts
+                    # an empty images list for pure-text prompts), not
+                    # self.text_pipe/LLMPipeline: LLMPipeline is built
+                    # against the same VLM export but assumes a plain
+                    # single-input text-generation graph signature, which
+                    # a VLM export does not have -- it fails at actual
+                    # inference time with "Port for tensor name input_ids
+                    # was not found" (the VLM graph's real input port is
+                    # named/shaped differently). This mirrors llm_bench's
+                    # own --optimum/visual_text_gen path, which likewise
+                    # always uses the VLM-aware pipeline for this model
+                    # family even for text-only prompts, never a plain
+                    # text pipeline.
+                    try:
+                        output = self.pipe.generate(prompt, [], cfg)
+                    except RuntimeError as err:
+                        raise RuntimeError(
+                            f"openvino-mx text-only (VLMPipeline) generate_until failed at request index {req_idx}: {err}"
+                        ) from err
+                else:
+                    llm_kwargs = self._llm_generate_kwargs(
+                        gen_kwargs, self.default_max_new_tokens
+                    )
+                    try:
+                        output = self.text_pipe.generate(prompt, **llm_kwargs)
+                    except RuntimeError as err:
+                        raise RuntimeError(
+                            f"openvino-mx text-only generate_until failed at request index {req_idx}: {err}"
+                        ) from err
             else:
                 if self.pipe is None:
                     raise ValueError(

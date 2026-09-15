@@ -23,15 +23,12 @@ metric_list:
 filter_list:
   - name: default
     filter:
-      # Word-boundary version: the previous pattern "([ABCD])" matched ANY
-      # occurrence of A/B/C/D anywhere in the text, including inside other
-      # words -- e.g. a model that answers "Answer:\nD" got scored on the
-      # "A" from "Answer" instead of the real answer "D", since that "A"
-      # appears first. \b anchors ensure only a standalone letter (not part
-      # of a larger word) is captured, so both bare "D" and "Answer:\nD"
-      # style responses are scored correctly.
+      # Smart regex extraction rule:
+      # 1. 优先匹配明确回答句中的选项（如 "Answer: D", "correct option is B", "Option C" 等）
+      # 2. 如果未显式提及，则捕获文本末尾独立出现的选项字母 \b([ABCD])\b (take_last / group_select: -1)
       - function: regex
-        regex_pattern: "\\b([ABCD])\\b"
+        group_select: -1
+        regex_pattern: '(?i)(?:answer|correct|choice|option)\s*(?:is|:|\s)*[*#_(\[]*\s*([ABCD])\b|\b([ABCD])\b'
       - function: take_first
 
 metadata:

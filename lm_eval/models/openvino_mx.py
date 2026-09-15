@@ -28,6 +28,33 @@ class OpenVINOMX(LM):
 
     MULTIMODAL = True
 
+    @staticmethod
+    def _parse_ov_config(raw_cfg) -> dict:
+        if raw_cfg is None:
+            return {}
+        if isinstance(raw_cfg, dict):
+            return raw_cfg
+        if isinstance(raw_cfg, str):
+            raw_cfg = raw_cfg.strip()
+            if not raw_cfg:
+                return {}
+            if raw_cfg.startswith("{"):
+                try:
+                    parsed = json.loads(raw_cfg)
+                    return parsed if isinstance(parsed, dict) else {}
+                except json.JSONDecodeError:
+                    eval_logger.warning("Failed to parse inline ov_config JSON: %s", raw_cfg)
+                    return {}
+            path = Path(raw_cfg)
+            if path.is_file():
+                try:
+                    parsed = json.loads(path.read_text())
+                    return parsed if isinstance(parsed, dict) else {}
+                except json.JSONDecodeError:
+                    eval_logger.warning("Failed to parse ov_config file as JSON: %s", path)
+                    return {}
+        return {}
+
     def __init__(
         self,
         pretrained: str,
@@ -66,6 +93,27 @@ class OpenVINOMX(LM):
             self.pipe = VLMPipeline(self.pretrained, self._device)
         self.allow_text_only = bool(kwargs.get("allow_text_only", True))
         self.prompt_suffix = str(kwargs.get("prompt_suffix", ""))
+
+        self.ov_config = self._parse_ov_config(kwargs.get("ov_config"))
+
+        # Parse apply_chat_template: default True unless specified False in kwargs or ov_config
+        self.apply_chat_template = kwargs.get("apply_chat_template")
+        if self.apply_chat_template is None and "apply_chat_template" in self.ov_config:
+            self.apply_chat_template = bool(self.ov_config["apply_chat_template"])
+        if self.apply_chat_template is None:
+            self.apply_chat_template = True
+        else:
+            self.apply_chat_template = bool(self.apply_chat_template)
+
+        # Parse enable_thinking: default False unless specified True in kwargs or ov_config
+        self.enable_thinking = kwargs.get("enable_thinking")
+        if self.enable_thinking is None and "enable_thinking" in self.ov_config:
+            self.enable_thinking = bool(self.ov_config["enable_thinking"])
+        if self.enable_thinking is None:
+            self.enable_thinking = False
+        else:
+            self.enable_thinking = bool(self.enable_thinking)
+
         self.text_pipe = LLMPipeline(self.pretrained, self._device)
         self.min_image_side = int(
             kwargs.get("min_image_side", self._infer_min_image_side(self.pretrained))
@@ -74,6 +122,11 @@ class OpenVINOMX(LM):
         self.debug_image_dir = Path(kwargs.get("debug_image_dir", "openvino_mx_debug_images"))
         self.debug_image_dir.mkdir(parents=True, exist_ok=True)
         self._image_dump_counter = 0
+
+        self.debug_prompt_log_path = kwargs.get("debug_prompt_log_path")
+        self.debug_failure_log_path = kwargs.get("debug_failure_log_path")
+        self.debug_prompt_log_max = int(kwargs.get("debug_prompt_log_max", 8))
+        self._prompt_log_count = 0
 
     @staticmethod
     def _infer_min_image_side(pretrained: str) -> int:
@@ -259,6 +312,25 @@ class OpenVINOMX(LM):
             kwargs["do_sample"] = gen_kwargs["do_sample"]
         return kwargs
 
+    def _format_chat_prompt(self, active_pipe, raw_prompt: str) -> tuple[str, bool]:
+        if not self.apply_chat_template:
+            return raw_prompt, False
+
+        if self.enable_thinking is False:
+            try:
+                tokenizer = getattr(active_pipe, "get_tokenizer", lambda: None)()
+                if tokenizer and hasattr(tokenizer, "apply_chat_template"):
+                    formatted = tokenizer.apply_chat_template(
+                        [{"role": "user", "content": raw_prompt}],
+                        add_generation_prompt=True,
+                        extra_context={"enable_thinking": False}
+                    )
+                    return formatted, False
+            except Exception as err:  # noqa: BLE001
+                eval_logger.warning("Failed to apply_chat_template with extra_context enable_thinking=False: %s", err)
+
+        return raw_prompt, True
+
     def generate_until(
         self, requests: list[Instance], disable_tqdm: bool = False
     ) -> list[str]:
@@ -292,22 +364,6 @@ class OpenVINOMX(LM):
             cfg.max_new_tokens = int(
                 gen_kwargs.get("max_gen_toks", self.default_max_new_tokens)
             )
-            # VLMPipeline's GenerationConfig defaults apply_chat_template to
-            # True (unlike llm_bench's LLMPipeline path, which always forces
-            # it False -- see text_generation.py's `gen_config.apply_chat_template
-            # = False`). For "thinking" models (e.g. Qwen3.5), the chat
-            # template's Jinja logic defaults enable_thinking to true unless
-            # explicitly told otherwise, and GenerationConfig has no
-            # enable_thinking field to override that from here -- so a
-            # templated prompt makes the model emit a long "Thinking
-            # Process..." block that eats the entire max_new_tokens budget
-            # before ever reaching a final answer, corrupting accuracy tasks
-            # like MMLU that expect a short direct answer. Disabling the
-            # template entirely (matching llm_bench's own behavior exactly)
-            # sends the model a raw, un-templated prompt, bypassing the
-            # thinking-mode trigger the same way the GenAI/LLMPipeline path
-            # already does.
-            cfg.apply_chat_template = False
 
             until = gen_kwargs.get("until")
             if until is not None and not isinstance(until, list):
@@ -320,6 +376,10 @@ class OpenVINOMX(LM):
             if self.prompt_suffix:
                 prompt = f"{prompt} {self.prompt_suffix}"
 
+            active_pipe = self.pipe if (image_tensors is not None or self.pipe is not None) else self.text_pipe
+            prompt, use_gen_cfg_template = self._format_chat_prompt(active_pipe, prompt)
+            cfg.apply_chat_template = use_gen_cfg_template
+
             if image_tensors is None:
                 if not self.allow_text_only:
                     raise ValueError(
@@ -327,24 +387,6 @@ class OpenVINOMX(LM):
                         "Set model_args allow_text_only=true to enable LLMPipeline fallback."
                     )
                 if self.pipe is not None:
-                    # `pretrained` is a VLM-shaped export (multi-component
-                    # IR with vision/embeddings/language sub-models, e.g.
-                    # NNCF-quantized Qwen3.5 exports) -- VLMPipeline was
-                    # already constructed successfully for it at __init__
-                    # time. A text-only request (no images) must still go
-                    # through THIS pipeline (VLMPipeline.generate accepts
-                    # an empty images list for pure-text prompts), not
-                    # self.text_pipe/LLMPipeline: LLMPipeline is built
-                    # against the same VLM export but assumes a plain
-                    # single-input text-generation graph signature, which
-                    # a VLM export does not have -- it fails at actual
-                    # inference time with "Port for tensor name input_ids
-                    # was not found" (the VLM graph's real input port is
-                    # named/shaped differently). This mirrors llm_bench's
-                    # own --optimum/visual_text_gen path, which likewise
-                    # always uses the VLM-aware pipeline for this model
-                    # family even for text-only prompts, never a plain
-                    # text pipeline.
                     try:
                         output = self.pipe.generate(prompt, [], cfg)
                     except RuntimeError as err:
@@ -377,7 +419,24 @@ class OpenVINOMX(LM):
                         f"openvino-mx generate_until failed at request index {req_idx} with image shapes {image_shapes}: {err}"
                     ) from err
             text = self._extract_generated_text(output)
-            results.append(self._apply_stop(text, until))
+            processed_text = self._apply_stop(text, until)
+
+            if self.debug_prompt_log_path and self._prompt_log_count < self.debug_prompt_log_max:
+                try:
+                    p_path = Path(self.debug_prompt_log_path)
+                    p_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(p_path, "a", encoding="utf-8") as pf:
+                        pf.write(
+                            f"=== Sample {self._prompt_log_count + 1} (Request {req_idx}) ===\n"
+                            f"--- [FULL PROMPT] ---\n{prompt}\n\n"
+                            f"--- [FULL RESPONSE] ---\n{processed_text}\n\n"
+                            + "=" * 60 + "\n\n"
+                        )
+                    self._prompt_log_count += 1
+                except Exception as err:  # noqa: BLE001
+                    eval_logger.warning("Failed to write debug_prompt_log_path: %s", err)
+
+            results.append(processed_text)
 
         return results
 

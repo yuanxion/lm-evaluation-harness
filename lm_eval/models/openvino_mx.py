@@ -380,6 +380,16 @@ class OpenVINOMX(LM):
             prompt, use_gen_cfg_template = self._format_chat_prompt(active_pipe, prompt)
             cfg.apply_chat_template = use_gen_cfg_template
 
+           if self.debug_prompt_log_path and self._prompt_log_count < self.debug_prompt_log_max:
+               try:
+                   p_path = Path(self.debug_prompt_log_path)
+                   p_path.parent.mkdir(parents=True, exist_ok=True)
+                   with open(p_path, "a", encoding="utf-8") as pf:
+                       pf.write(f"=== Prompt Sample {self._prompt_log_count + 1} (Request {req_idx}) ===\n{prompt}\n\n" + "=" * 60 + "\n\n")
+                   self._prompt_log_count += 1
+               except Exception as err:  # noqa: BLE001
+                   eval_logger.warning("Failed to write debug_prompt_log_path: %s", err)
+
             if image_tensors is None:
                 if not self.allow_text_only:
                     raise ValueError(
@@ -387,6 +397,24 @@ class OpenVINOMX(LM):
                         "Set model_args allow_text_only=true to enable LLMPipeline fallback."
                     )
                 if self.pipe is not None:
+                    # `pretrained` is a VLM-shaped export (multi-component
+                    # IR with vision/embeddings/language sub-models, e.g.
+                    # NNCF-quantized Qwen3.5 exports) -- VLMPipeline was
+                    # already constructed successfully for it at __init__
+                    # time. A text-only request (no images) must still go
+                    # through THIS pipeline (VLMPipeline.generate accepts
+                    # an empty images list for pure-text prompts), not
+                    # self.text_pipe/LLMPipeline: LLMPipeline is built
+                    # against the same VLM export but assumes a plain
+                    # single-input text-generation graph signature, which
+                    # a VLM export does not have -- it fails at actual
+                    # inference time with "Port for tensor name input_ids
+                    # was not found" (the VLM graph's real input port is
+                    # named/shaped differently). This mirrors llm_bench's
+                    # own --optimum/visual_text_gen path, which likewise
+                    # always uses the VLM-aware pipeline for this model
+                    # family even for text-only prompts, never a plain
+                    # text pipeline.
                     try:
                         output = self.pipe.generate(prompt, [], cfg)
                     except RuntimeError as err:

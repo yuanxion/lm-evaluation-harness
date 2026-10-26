@@ -11,6 +11,7 @@ target_delimiter: ":"
 generation_kwargs:
   until:
     - "</s>"
+    - "<|im_end|>"
 
 metric_list:
   - metric: exact_match
@@ -23,12 +24,13 @@ metric_list:
 filter_list:
   - name: default
     filter:
+      - function: strip_think
       # Smart regex extraction rule:
-      # 1. 优先匹配明确回答句中的选项（如 "Answer: D", "correct option is B", "Option C" 等）
-      # 2. 如果未显式提及，则捕获文本末尾独立出现的选项字母 \b([ABCD])\b (take_last / group_select: -1)
+      # 1. 优先匹配明确回答句中的选项（如 "Answer: D", "correct option is B", "Option C", "Final decision: B" 等）
+      # 2. 如果未显式提及，则捕获文本末尾独立出现的严格大写选项字母 \b([A-D])\b (避免大小写不敏感误匹配英文冠词 "a")
       - function: regex
         group_select: -1
-        regex_pattern: '(?i)(?:answer|correct|choice|option)\s*(?:is|:|\s)*[*#_(\[]*\s*([ABCD])\b|\b([ABCD])\b'
+        regex_pattern: '(?i)(?:final\s+(?:answer|decision)|answer|correct(?:\s+choice|\s+option)?|choice|option)\s*(?:is|:|\s)*[*#_(\[]*\s*([A-Da-d])\b|\b([A-D])\b'
       - function: take_first
 
 metadata:

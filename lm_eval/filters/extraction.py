@@ -12,6 +12,21 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
 
+@register_filter("strip_think")
+class StripThinkFilter(Filter):
+    def apply(self, resps: Iterable[Sequence[str]], docs: Sequence[dict[str, Any]]) -> list[list[str]]:
+        def final_answer(response: str) -> str:
+            if not isinstance(response, str):
+                return ""
+            if "</think>" in response:
+                return response.rsplit("</think>", 1)[1].strip()
+            if "<think>" in response:
+                return ""
+            return response
+
+        return [[final_answer(response) for response in responses] for responses in resps]
+
+
 @register_filter("regex")
 class RegexFilter(Filter):
     """A filter that extracts values from text using regex pattern matching.
